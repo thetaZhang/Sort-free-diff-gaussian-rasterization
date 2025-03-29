@@ -12,6 +12,7 @@
 #pragma once
 
 #include <iostream>
+#include <sys/types.h>
 #include <vector>
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
@@ -27,18 +28,23 @@ namespace CudaRasterizer
 	}
 
 	struct GeometryState
-	{
-		size_t scan_size;
+	{ 
+    //for Sort-free
+		//size_t scan_size;
 		float* depths;
-		char* scanning_space;
+    //for Sort-free
+		//char* scanning_space;
 		bool* clamped;
 		int* internal_radii;
 		float2* means2D;
 		float* cov3D;
 		float4* conic_opacity;
 		float* rgb;
+    /*for Sort-free
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
+    */
+    float* depthweights; // for Sort-free
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
@@ -54,15 +60,31 @@ namespace CudaRasterizer
 
 	struct BinningState
 	{
+    /*for Sort-free
 		size_t sorting_size;
 		uint64_t* point_list_keys_unsorted;
 		uint64_t* point_list_keys;
 		uint32_t* point_list_unsorted;
 		uint32_t* point_list;
 		char* list_sorting_space;
+    */
+    uint32_t* point_list_idx; // gaussian_point_index
+    uint32_t* point_list_tile; // tile_index
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
+
+    //for Sort-free     
+    struct TileState
+    {
+        size_t tile_scan_size;
+        uint32_t* tile_scanning_space;
+        uint32_t* tile_point_touched; // number of gaussian that touch each tile
+        uint32_t* tile_offsets; // offset in the point list for each tile
+        uint32_t* tile_counters; // counter buffer 
+
+        static TileState fromChunk(char*& chunk, size_t );
+    };
 
 	template<typename T> 
 	size_t required(size_t P)

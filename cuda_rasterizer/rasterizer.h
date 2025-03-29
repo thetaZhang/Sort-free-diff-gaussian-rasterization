@@ -30,18 +30,23 @@ namespace CudaRasterizer
 
 		static int forward(
 			std::function<char* (size_t)> geometryBuffer,
+      std::function<char* (size_t)> tileBuffer, //for Sort-free
 			std::function<char* (size_t)> binningBuffer,
 			std::function<char* (size_t)> imageBuffer,
 			const int P, int D, int M,
 			const float* background,
+      const float background_weight, //for Sort-free
 			const int width, int height,
 			const float* means3D,
 			const float* shs,
 			const float* colors_precomp,
-			const float* opacities,
+			//const float* opacities,
+      const float* shs_opacities, //for Sort-free
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
+      const float sigma, // for Sort-free
+      const float* v_depthweight, // for Sort-free
 			const float* cov3D_precomp,
 			const float* viewmatrix,
 			const float* projmatrix,

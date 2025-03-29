@@ -35,12 +35,16 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
+  const float background_weight, // for Sort-free
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
-    const torch::Tensor& opacity,
+    //const torch::Tensor& opacity,
+    const torch::Tensor& sh_opacity, // for Sort-free
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
+  const float sigma,// for Sort-free
+  const torch::Tensor& v_depthweight,// for Sort-free
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -71,9 +75,11 @@ RasterizeGaussiansCUDA(
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor tileBuffer = torch::empty({0},options.device(device));// for Sort-free
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
   torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+  std::function<char*(size_t)> tileFunc = resizeFunctional(tileBuffer);// for Sort-free
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
   
@@ -88,18 +94,22 @@ RasterizeGaussiansCUDA(
 
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,
+      tileFunc, // for Sort-free
 		binningFunc,
 		imgFunc,
 	    P, degree, M,
 		background.contiguous().data<float>(),
+    background_weight,// for Sort-free
 		W, H,
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
 		colors.contiguous().data<float>(), 
-		opacity.contiguous().data<float>(), 
+		sh_opacity.contiguous().data_ptr<float>(), 
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
+    sigma,// for Sort-free
+    v_depthweight.contiguous().data<float>(),// for Sort-free
 		cov3D_precomp.contiguous().data<float>(), 
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),

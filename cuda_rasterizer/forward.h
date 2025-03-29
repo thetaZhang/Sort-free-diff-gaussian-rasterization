@@ -51,14 +51,16 @@ namespace FORWARD
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
-		const uint32_t* point_list,
+    const uint32_t* point_list_idx, // for Sort-free
 		int W, int H,
 		const float2* points_xy_image,
 		const float* features,
+    const float* depth_weights, // for Sort-free
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
+    const float bg_weight, // for Sort-free
 		float* out_color);
 }
 

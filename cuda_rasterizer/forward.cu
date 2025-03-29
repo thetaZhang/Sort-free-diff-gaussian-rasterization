@@ -70,6 +70,61 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	return glm::max(result, 0.0f);
 }
 
+
+// for Sort-free
+__device__ float computeOpacityFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs_opacity, bool* clamped)
+{
+	// The implementation is loosely based on code for 
+	// "Differentiable Point-Based Radiance Fields for 
+	// Efficient View Synthesis" by Zhang et al. (2022)
+	glm::vec3 pos = means[idx];
+	glm::vec3 dir = pos - campos;
+	dir = dir / glm::length(dir);
+
+	glm::vec3* sh = ((glm::vec3*)shs_opacity) + idx * max_coeffs;
+	glm::vec3 result = SH_C0 * sh[0];
+
+	if (deg > 0)
+	{
+		float x = dir.x;
+		float y = dir.y;
+		float z = dir.z;
+		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+
+		if (deg > 1)
+		{
+			float xx = x * x, yy = y * y, zz = z * z;
+			float xy = x * y, yz = y * z, xz = x * z;
+			result = result +
+				SH_C2[0] * xy * sh[4] +
+				SH_C2[1] * yz * sh[5] +
+				SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
+				SH_C2[3] * xz * sh[7] +
+				SH_C2[4] * (xx - yy) * sh[8];
+
+			if (deg > 2)
+			{
+				result = result +
+					SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
+					SH_C3[1] * xy * z * sh[10] +
+					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
+					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
+					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
+					SH_C3[5] * z * (xx - yy) * sh[14] +
+					SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+			}
+		}
+	}
+	result += 0.5f;
+
+	// RGB colors are clamped to positive values. If values are
+	// clamped, we need to keep track of this for the backward pass.
+	clamped[3 * idx + 0] = (result.x < 0);
+	clamped[3 * idx + 1] = (result.y < 0);
+	clamped[3 * idx + 2] = (result.z < 0);
+	return glm::max(result, 0.0f);
+}
+
 // Forward version of 2D covariance matrix computation
 __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
@@ -158,6 +213,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
+  const float sigma,// for Sort-free
+  const float* v_depthweight,// for Sort-free
 	const float* opacities,
 	const float* shs,
 	bool* clamped,
@@ -172,6 +229,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
+  float* depthweights,// for Sort-free
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
@@ -248,11 +306,23 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
+
+  // for Sort-free
+  depthweights[idx] = (max(0.0f,1 - depths[idx] / sigma)) * v_depthweight[idx];
+
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+  // for Sort-free
+  //tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+  for (int y = rect_min.y; y < rect_max.y; y++)
+  {
+    for (int x = rect_min.x; x < rect_max.x; x++)
+    {
+      atomicAdd(&tiles_touched[y * grid.x + x], 1); // accumulate the number of gaussians in each tile
+    }
+  }
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -262,14 +332,16 @@ template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint32_t* __restrict__ point_list_idx,// for Sort-free
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+  const float* __restrict__ depthweights,// for Sort-free
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
+  const float bg_weight,// for Sort-free
 	float* __restrict__ out_color)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -297,10 +369,11 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
 	// Initialize helper variables
-	float T = 1.0f;
+	//float T = 1.0f; // for Sort-free
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+  float C_denominator[CHANNELS] = { 0 };// for Sort-free
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -343,6 +416,8 @@ renderCUDA(
 			float alpha = min(0.99f, con_o.w * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
+
+      /* for Sort-free
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
@@ -355,6 +430,14 @@ renderCUDA(
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
 			T = test_T;
+      */
+
+      // for Sort-free
+      for (int ch = 0; ch < CHANNELS; ch++)
+      {
+        C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * depthweights[collected_id[j]];
+        C_denominator[ch] += alpha * depthweights[collected_id[j]];
+      }
 
 			// Keep track of last range entry to update this
 			// pixel.
@@ -369,33 +452,37 @@ renderCUDA(
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
-			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+			out_color[ch * H * W + pix_id] = (C[ch] + bg_weight * bg_color[ch])/(C_denominator[ch] + bg_weight);
 	}
 }
 
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
-	const uint32_t* point_list,
+	const uint32_t* point_list_idx,// for Sort-free
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
+  const float* depth_weights,// for Sort-free
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
+  const float bg_weight,// for Sort-free
 	float* out_color)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
-		point_list,
+		point_list_idx,// for Sort-free
 		W, H,
 		means2D,
 		colors,
+    depth_weights,// for Sort-free
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
+    bg_weight,// for Sort-free
 		out_color);
 }
 
@@ -404,6 +491,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
+  const float sigma,// for Sort-free
+  const float* v_depthweight,// for Sort-free
 	const float* opacities,
 	const float* shs,
 	bool* clamped,
@@ -418,6 +507,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	int* radii,
 	float2* means2D,
 	float* depths,
+  float* depthweights,// for Sort-free
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
@@ -431,6 +521,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		scales,
 		scale_modifier,
 		rotations,
+    sigma,// for Sort-free
+    v_depthweight,// for Sort-free
 		opacities,
 		shs,
 		clamped,
@@ -445,6 +537,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		radii,
 		means2D,
 		depths,
+    depthweights,// for Sort-free
 		cov3Ds,
 		rgb,
 		conic_opacity,
